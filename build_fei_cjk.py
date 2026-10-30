@@ -1391,6 +1391,15 @@ def update_fei_font(font_path, subfamily, full_name, ps_name):
         if nrec.nameID in name_map:
             font["name"].setName(name_map[nrec.nameID], nrec.nameID, nrec.platformID, nrec.platEncID, nrec.langID)
 
+    # Keep weight metadata in sync with the style so CoreText / NSFontManager
+    # resolve the Regular and Bold faces correctly (family-only lookups and
+    # bold trait conversion both depend on these bits).
+    is_bold = subfamily == "Bold"
+    font["OS/2"].usWeightClass = 700 if is_bold else 400
+    font["OS/2"].fsSelection &= ~(0x20 | 0x40)  # clear BOLD + REGULAR
+    font["OS/2"].fsSelection |= 0x20 if is_bold else 0x40
+    font["head"].macStyle = (font["head"].macStyle & ~0x1) | (0x1 if is_bold else 0x0)
+
     font.save(font_path)
     dt = time.time() - t0
     print(

@@ -597,14 +597,69 @@ def update_fei_math():
     with Pool(cpu_count()) as pool:
         for gname, new_coords, new_flags in pool.imap_unordered(_math_remodel_worker, tasks, chunksize=128):
             g = glyf[gname]
+            old_w = g.xMax - g.xMin
+            old_adv, old_lsb = hmtx[gname]
+            old_rsb = old_adv - g.xMax
+            cps = rev_cmap.get(gname, [])
+            kind = classify_math_glyph(gname, cps, vert_parts, horiz_parts)
+
             g.coordinates = GlyphCoordinates(new_coords)
             g.flags = new_flags
             g.program = ttProgram.Program()
             g.recalcBounds(glyf)
-            adv, _ = hmtx[gname]
-            hmtx[gname] = (adv, g.xMin)
+            if kind != "preserve_bounds":
+                # Ensure lsb >= 28 and rsb >= 36 (and >= 44 for italic f u1D453 so f''(x) has clean space!)
+                min_lsb = 28
+                if g.xMin < min_lsb:
+                    dx = min_lsb - g.xMin
+                    c_arr = np.array(g.coordinates, dtype=int)
+                    c_arr[:, 0] += dx
+                    g.coordinates = GlyphCoordinates(c_arr.tolist())
+                    g.recalcBounds(glyf)
+                min_rsb = 88 if gname == "u1D453" else 36
+                rsb = max(min_rsb, old_rsb)
+                new_adv = g.xMax + rsb
+                hmtx[gname] = (new_adv, g.xMin)
+            else:
+                if gname.startswith("parenleft.s"):
+                    # Give tall left parentheses generous left sidebearing so function names like softmax( don't crowd!
+                    target_lsb = 105
+                    dx = target_lsb - g.xMin
+                    if dx > 0:
+                        c_arr = np.array(g.coordinates, dtype=int)
+                        c_arr[:, 0] += dx
+                        g.coordinates = GlyphCoordinates(c_arr.tolist())
+                        g.recalcBounds(glyf)
+                        old_adv += dx
+                hmtx[gname] = (old_adv, g.xMin)
 
-    # 4. Synchronize .ssty and .ssty2 script variants from their newly remodeled base glyphs!
+    # 4. Rebuild prime, double-prime, and triple-prime (minute, second, uni2034) with generous
+    #    lsb (115u) and wide inter-prime separation (225u step) so f'(x), f''(x), f'''(x) never crowd or overlap!
+    if 0x2032 in cmap:
+        gn_p1 = cmap[0x2032]
+        g_p1 = extract_simple_glyph(glyf[gn_p1], glyf)
+        if g_p1 is not None and g_p1.numberOfContours > 0:
+            # Take single prime contour, slim slightly if needed, and place at xMin = 115
+            g_single = extract_contour_subset_glyph(g_p1, [0], glyf)
+            w_p1 = g_single.xMax - g_single.xMin
+            if w_p1 > 135:
+                g_single = transform_simple_glyph(g_single, glyf, sx=130.0 / w_p1, sy=1.0, ref_x=float(g_single.xMin), ref_y=0.0)
+            prime_lsb = 115.0
+            g_single = transform_simple_glyph(g_single, glyf, dx=prime_lsb - g_single.xMin, dy=0.0)
+            w_s = g_single.xMax - g_single.xMin
+            step_x = w_s + 82.0  # 82 font units of clear white gap between adjacent prime strokes!
+
+            g_double = combine_simple_glyphs([(g_single, 0.0, 0.0), (g_single, step_x, 0.0)], glyf)
+            g_triple = combine_simple_glyphs([(g_single, 0.0, 0.0), (g_single, step_x, 0.0), (g_single, 2.0 * step_x, 0.0)], glyf)
+
+            for cp_p, gp in ((0x2032, g_single), (0x2033, g_double), (0x2034, g_triple)):
+                if cp_p in cmap:
+                    gn_p = cmap[cp_p]
+                    glyf[gn_p] = copy.deepcopy(gp)
+                    glyf[gn_p].recalcBounds(glyf)
+                    hmtx[gn_p] = (gp.xMax + 65, gp.xMin)
+
+    # 5. Synchronize .ssty and .ssty2 script variants from their newly remodeled base glyphs!
     ssty_updated = 0
     for gname in font.getGlyphOrder():
         if gname.endswith(".ssty") or gname.endswith(".ssty2"):
@@ -627,7 +682,7 @@ def update_fei_math():
                 sg.recalcBounds(glyf)
                 glyf[gname] = sg
                 base_adv, _ = hmtx[base_gn]
-                hmtx[gname] = (base_adv, sg.xMin)
+                hmtx[gname] = (max(base_adv, sg.xMax + 34), sg.xMin)
                 ssty_updated += 1
 
     for gname in font.getGlyphOrder():

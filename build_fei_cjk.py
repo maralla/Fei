@@ -485,8 +485,107 @@ def bezier_capsule_terminals_and_round_corners(coords, flags, end_pts, is_cjk=Fa
     return out_coords, out_flags
 
 
-def redesign_english_bezier_anime(orig_g, glyf_table, ch, old_adv, old_lsb, punct_dy):
-    """Redesign an English/ASCII glyph into the bigger, fuller unified Anime look (cap=665, x=485)."""
+def measure_glyph_stroke_units(coords, flags, ends):
+    """Measure 85th-percentile stroke thickness of a glyph in font units (1000 UPM) via 250px raster EDT."""
+    scale = 0.25
+    pad = 24
+    x0, y0 = coords.min(axis=0)
+    x1, y1 = coords.max(axis=0)
+    W = int(np.ceil((x1 - x0) * scale)) + 2 * pad
+    H = int(np.ceil((y1 - y0) * scale)) + 2 * pad
+    if W < 10 or H < 10:
+        return 62.0
+    from PIL import Image, ImageDraw
+    from scipy.ndimage import distance_transform_edt
+
+    im = Image.new("L", (W, H), 0)
+    d = ImageDraw.Draw(im)
+    s = 0
+    polys = []
+    for e in ends:
+        c_pts = sample_tt_contour_points(coords[s : e + 1], flags[s : e + 1])
+        px, py = c_pts[:, 0], c_pts[:, 1]
+        area = 0.5 * float(np.sum(px * np.roll(py, -1) - np.roll(px, -1) * py))
+        pts_img = [(float((p[0] - x0) * scale + pad), float((y1 - p[1]) * scale + pad)) for p in c_pts]
+        polys.append((area, pts_img))
+        s = e + 1
+    for area, pts_img in sorted(polys, key=lambda x: x[0]):
+        if len(pts_img) >= 3:
+            d.polygon(pts_img, fill=255 if area < 0 else 0)
+    arr = np.array(im) > 128
+    if not arr.any():
+        return 62.0
+    dt = distance_transform_edt(arr)
+    return float(np.percentile(dt[arr], 85) * 2.0 / scale)
+
+
+def adjust_glyph_stroke_thickness(coords, flags, end_pts, delta_w):
+    """Adjust a simple glyph's stroke thickness by delta_w per side, guarded by opposing-wall distance."""
+    if abs(delta_w) < 0.15:
+        return coords
+    out = coords.copy()
+    total_pts = len(out)
+    idx_all = np.arange(total_pts)
+    diff_x = out[None, :, 0] - out[:, None, 0]
+    diff_y = out[None, :, 1] - out[:, None, 1]
+    dist_all = np.sqrt(diff_x * diff_x + diff_y * diff_y) + 1e-6
+
+    all_normals = np.zeros_like(out)
+    areas = []
+    start = 0
+    for end in end_pts:
+        pts = out[start : end + 1]
+        n = len(pts)
+        px, py = pts[:, 0], pts[:, 1]
+        area = 0.5 * float(np.sum(px * np.roll(py, -1) - np.roll(px, -1) * py))
+        areas.append((start, end, area))
+        if n >= 4:
+            d = np.roll(pts, -1, axis=0) - np.roll(pts, 1, axis=0)
+            t = d / (np.hypot(d[:, 0], d[:, 1])[:, None] + 1e-6)
+            normals = smooth_1d_periodic(np.column_stack([-t[:, 1], t[:, 0]]), passes=2)
+            normals = normals / (np.hypot(normals[:, 0], normals[:, 1])[:, None] + 1e-6)
+            all_normals[start : end + 1] = normals
+        start = end + 1
+
+    for start, end, area in areas:
+        pts = out[start : end + 1].copy()
+        n = len(pts)
+        if n < 4:
+            continue
+        normals = all_normals[start : end + 1]
+        if area < 0:
+            c_rows = np.arange(start, end + 1)
+            same_c = (idx_all[None, :] >= start) & (idx_all[None, :] <= end)
+            c_pos = c_rows[:, None] - start
+            j_pos = idx_all[None, :] - start
+            cyc_d = np.minimum(np.abs(c_pos - j_pos), n - np.abs(c_pos - j_pos))
+            ignore = same_c & (cyc_d <= 2)
+
+            dx_sub = diff_x[c_rows, :]
+            dy_sub = diff_y[c_rows, :]
+            d_sub = np.where(ignore, 1e6, dist_all[c_rows, :])
+            dir_cos = (dx_sub * normals[:, 0:1] + dy_sub * normals[:, 1:2]) / d_sub
+            norm_dot = normals[:, 0:1] * all_normals[None, :, 0] + normals[:, 1:2] * all_normals[None, :, 1]
+
+            if delta_w > 0:
+                is_opp = (dir_cos > 0.45) & (norm_dot < -0.30)
+                ahead_dist = np.where(is_opp, d_sub, 1e6).min(axis=1)
+                max_allow = smooth_1d_periodic(np.maximum(0.0, 0.36 * (ahead_dist - 14.0)), passes=2)
+                off = np.minimum(delta_w, max_allow)
+            else:
+                is_back = (dir_cos < -0.55) & (norm_dot < -0.30) & (d_sub >= 18.0)
+                self_th = np.where(is_back, d_sub, 1e6).min(axis=1)
+                min_allow = -smooth_1d_periodic(np.maximum(0.0, 0.42 * (self_th - 28.0)), passes=2)
+                off = np.maximum(delta_w, min_allow)
+            pts = pts + off[:, None] * normals
+        elif area > 0 and delta_w > 0:
+            pts = pts + (0.25 * delta_w) * normals
+        out[start : end + 1] = pts
+    return out
+
+
+def redesign_english_bezier_anime(orig_g, glyf_table, ch, old_adv, old_lsb, punct_dy, is_bold=False):
+    """Redesign an English/ASCII glyph into the bigger, fuller unified Anime look with equalized stroke weight."""
     gg = copy.deepcopy(orig_g)
     if gg.isComposite() or gg.numberOfContours <= 0 or not hasattr(gg, "coordinates") or len(gg.coordinates) == 0:
         return gg, (old_adv, old_lsb)
@@ -507,10 +606,15 @@ def redesign_english_bezier_anime(orig_g, glyf_table, ch, old_adv, old_lsb, punc
     if ch.isalnum():
         u = np.clip((coords[:, 0] - cx) / rw, -1.25, 1.25)
         v = np.clip((coords[:, 1] - cy) / rh, -1.25, 1.25)
-        u_anime = u + 0.16 * u * (1.0 - np.clip(u * u, 0.0, 1.0)) - 0.028 * (u * v) + 0.020 * v
-        v_anime = v + 0.12 * v * (1.0 - np.clip(v * v, 0.0, 1.0))
-        coords[:, 0] = cx + rw * 1.08 * u_anime
-        coords[:, 1] = cy + rh * v_anime
+        u2, v2 = np.clip(u * u, 0.0, 1.0), np.clip(v * v, 0.0, 1.0)
+        # Separable Shear-Scale Anime Diffeomorphism (du'/du depends ONLY on v so center stems like 'T'
+        # and outer stems like 'h', 'H', 'n' maintain identical stroke thickness!)
+        sx_v = 1.0 + 0.12 * (1.0 - v2) - 0.025 * v
+        bx_v = 0.020 * (1.0 - v2) + 0.018 * v
+        sy_u = 1.0 + 0.08 * (1.0 - u2)
+        by_u = 0.020 * (1.0 - u2)
+        coords[:, 0] = cx + rw * 1.04 * (sx_v * u + bx_v)
+        coords[:, 1] = cy + rh * (sy_u * v + by_u)
 
     x0, y0 = coords.min(axis=0)
     x1, y1 = coords.max(axis=0)
@@ -545,9 +649,16 @@ def redesign_english_bezier_anime(orig_g, glyf_table, ch, old_adv, old_lsb, punc
 
     target_h = target_ymax - target_ymin
     sy = target_h / cur_h if ch.isalnum() else 1.07
-    sx = float(np.clip(sy, 0.96, 1.18)) if ch.isalnum() else 1.07
+    sx = float(np.clip(sy, 0.96, 1.14)) if ch.isalnum() else 1.07
     coords[:, 0] = x0 + sx * (coords[:, 0] - x0)
     coords[:, 1] = target_ymin + sy * (coords[:, 1] - y0)
+
+    # Equalize stroke thickness across all alphanumeric glyphs (slimming overly thick 'T', 'I', '1' and plumping thin letters)
+    if ch.isalnum():
+        cur_sw = measure_glyph_stroke_units(coords, flags, end_pts)
+        target_sw = 82.0 if is_bold else 63.0
+        delta_w = float(np.clip(0.55 * (target_sw - cur_sw), -8.5, 5.5))
+        coords = adjust_glyph_stroke_thickness(coords, flags, end_pts, delta_w)
 
     lsb = max(30, old_lsb)
     coords[:, 0] += lsb - coords[:, 0].min()
@@ -1025,7 +1136,7 @@ def build_reused_fei_glyphs(fei_base, fei_math, is_bold=False):
             adv, lsb = fhmtx[fgn]
             if orig_g.numberOfContours > 0 and not orig_g.isComposite() and cp <= 0x007E:
                 ch = chr(cp)
-                gg, new_m = redesign_english_bezier_anime(orig_g, fglyf, ch, adv, lsb, punct_dy)
+                gg, new_m = redesign_english_bezier_anime(orig_g, fglyf, ch, adv, lsb, punct_dy, is_bold=is_bold)
                 reused[cp] = (gg, new_m)
             elif orig_g.numberOfContours > 0 and not orig_g.isComposite():
                 gg = transform_simple_glyph(orig_g, fglyf, dy=punct_dy)
@@ -1053,11 +1164,18 @@ def build_reused_fei_glyphs(fei_base, fei_math, is_bold=False):
         0x207E: ord(")"),
         0x207F: ord("n"),
     }
+    sup_gain = 10.5 if is_bold else 8.2
     for sup_cp, base_cp in sup_map.items():
         if base_cp in reused:
             base_g, (base_adv, _) = reused[base_cp]
-            gg = transform_simple_glyph(base_g, fglyf, sx=0.62, sy=0.62, dx=10.0, dy=285.0, ref_x=0.0, ref_y=0.0)
-            reused[sup_cp] = (gg, (int(round(base_adv * 0.64)) + 20, gg.xMin))
+            gg = transform_simple_glyph(base_g, fglyf, sx=0.66, sy=0.65, dx=12.0, dy=282.0, ref_x=0.0, ref_y=0.0)
+            if gg.numberOfContours > 0 and not gg.isComposite():
+                c_sup = adjust_glyph_stroke_thickness(
+                    np.array(gg.coordinates, dtype=float), gg.flags, gg.endPtsOfContours, delta_w=sup_gain
+                )
+                gg.coordinates = GlyphCoordinates(np.round(c_sup).astype(int).tolist())
+                gg.recalcBounds(fglyf)
+            reused[sup_cp] = (gg, (max(int(round(base_adv * 0.68)) + 24, gg.xMax + 24), gg.xMin))
 
     sub_map = {
         **{0x2080 + d: ord("0") + d for d in range(10)},
@@ -1087,8 +1205,14 @@ def build_reused_fei_glyphs(fei_base, fei_math, is_bold=False):
     for sub_cp, base_cp in sub_map.items():
         if base_cp in reused:
             base_g, (base_adv, _) = reused[base_cp]
-            gg = transform_simple_glyph(base_g, fglyf, sx=0.62, sy=0.62, dx=10.0, dy=-125.0, ref_x=0.0, ref_y=0.0)
-            reused[sub_cp] = (gg, (int(round(base_adv * 0.64)) + 20, gg.xMin))
+            gg = transform_simple_glyph(base_g, fglyf, sx=0.66, sy=0.65, dx=12.0, dy=-125.0, ref_x=0.0, ref_y=0.0)
+            if gg.numberOfContours > 0 and not gg.isComposite():
+                c_sub = adjust_glyph_stroke_thickness(
+                    np.array(gg.coordinates, dtype=float), gg.flags, gg.endPtsOfContours, delta_w=sup_gain
+                )
+                gg.coordinates = GlyphCoordinates(np.round(c_sub).astype(int).tolist())
+                gg.recalcBounds(fglyf)
+            reused[sub_cp] = (gg, (max(int(round(base_adv * 0.68)) + 24, gg.xMax + 24), gg.xMin))
 
     cjk_adv = 900
     for fw_cp in range(0xFF01, 0xFF5F):

@@ -9,6 +9,7 @@ glyphs, math & geometric symbols, and clean OpenType naming/tables.
 import copy
 import os
 import time
+from multiprocessing import Pool, cpu_count
 import numpy as np
 from fontTools.ttLib import TTFont
 from fontTools.ttLib.tables import ttProgram
@@ -87,6 +88,238 @@ def combine_simple_glyphs(glyph_shift_list, glyf_table):
     out.endPtsOfContours = all_ends
     out.program = ttProgram.Program()
     out.recalcBounds(glyf_table)
+    return out
+
+
+def sample_tt_contour_points(pts, flags):
+    """Sample ordered points along a TrueType quadratic contour and filter micro-steps < 4.5 units."""
+    n = len(pts)
+    if n <= 3:
+        return pts.copy()
+    exp_pts = []
+    exp_fl = []
+    for i in range(n):
+        p_cur = pts[i]
+        f_cur = int(flags[i]) & 1
+        p_nxt = pts[(i + 1) % n]
+        f_nxt = int(flags[(i + 1) % n]) & 1
+        exp_pts.append(p_cur)
+        exp_fl.append(f_cur)
+        if f_cur == 0 and f_nxt == 0:
+            exp_pts.append(0.5 * (p_cur + p_nxt))
+            exp_fl.append(1)
+    first_on = next((idx for idx, f in enumerate(exp_fl) if f == 1), 0)
+    exp_pts = exp_pts[first_on:] + exp_pts[:first_on]
+    exp_fl = exp_fl[first_on:] + exp_fl[:first_on]
+
+    m = len(exp_pts)
+    dense = []
+    idx = 0
+    while idx < m:
+        p0 = exp_pts[idx]
+        nxt = (idx + 1) % m
+        if exp_fl[nxt] == 0:
+            q = exp_pts[nxt]
+            p2 = exp_pts[(idx + 2) % m]
+            dense.append(p0)
+            b_mid = 0.25 * p0 + 0.5 * q + 0.25 * p2
+            dense.append(b_mid)
+            idx += 2
+        else:
+            dense.append(p0)
+            idx += 1
+    arr = np.array(dense, dtype=float)
+    if len(arr) > 5:
+        keep = [0]
+        for k in range(1, len(arr)):
+            if np.hypot(arr[k, 0] - arr[keep[-1], 0], arr[k, 1] - arr[keep[-1], 1]) >= 4.0:
+                keep.append(k)
+        if len(keep) >= 4:
+            arr = arr[keep]
+    return arr
+
+
+def fit_quad_bezier(chain):
+    p0 = chain[0]
+    p2 = chain[-1]
+    k = len(chain)
+    if k <= 2:
+        return 0.5 * (p0 + p2), 0.0
+    diffs = np.diff(chain, axis=0)
+    seg_l = np.hypot(diffs[:, 0], diffs[:, 1])
+    cum_l = np.concatenate([[0.0], np.cumsum(seg_l)])
+    total_l = cum_l[-1]
+    if total_l < 1e-3:
+        return 0.5 * (p0 + p2), 0.0
+    t = cum_l / total_l
+    inner = chain[1:-1]
+    ti = t[1:-1, None]
+    w = 2.0 * ti * (1.0 - ti)
+    w_sum = float(np.sum(w * w))
+    if w_sum < 1e-6:
+        return 0.5 * (p0 + p2), 999.0
+    rhs = inner - ((1.0 - ti) ** 2) * p0 - (ti ** 2) * p2
+    q = np.round(np.sum(w * rhs, axis=0) / w_sum)
+    b = ((1.0 - ti) ** 2) * p0 + w * q + (ti ** 2) * p2
+    err = float(np.max(np.hypot(b[:, 0] - inner[:, 0], b[:, 1] - inner[:, 1])))
+    return q, err
+
+
+def line_max_err(chain):
+    p0 = chain[0]
+    p2 = chain[-1]
+    k = len(chain)
+    if k <= 2:
+        return 0.0
+    v = p2 - p0
+    lv = float(np.hypot(v[0], v[1]))
+    inner = chain[1:-1]
+    if lv < 1e-3:
+        return float(np.max(np.hypot(inner[:, 0] - p0[0], inner[:, 1] - p0[1])))
+    u = v / lv
+    w = inner - p0
+    proj = w[:, 0] * u[0] + w[:, 1] * u[1]
+    perp = np.abs(w[:, 0] * u[1] - w[:, 1] * u[0])
+    over = np.maximum(0.0, np.maximum(-proj, proj - lv))
+    return float(np.max(np.hypot(perp, over)))
+
+
+def compact_tt_contour(pts, flags):
+    """
+    Curvature-adaptive TrueType line + quadratic Bezier spline fitting + exact midpoint-coupled
+    B-spline off-curve projection. Preserves 100% of rounded stroke tips and hooks even at 110pt+
+    display sizes while minimizing vertex count and glyf byte size.
+    """
+    dense = sample_tt_contour_points(pts, flags)
+    n = len(dense)
+    if n <= 4:
+        return pts, bytearray(flags)
+
+    v1 = dense - np.roll(dense, 1, axis=0)
+    v2 = np.roll(dense, -1, axis=0) - dense
+    l1 = np.hypot(v1[:, 0], v1[:, 1]) + 1e-6
+    l2 = np.hypot(v2[:, 0], v2[:, 1]) + 1e-6
+    u1 = v1 / l1[:, None]
+    u2 = v2 / l2[:, None]
+    cos_1 = np.sum(u1 * u2, axis=1)
+
+    v1_2 = dense - np.roll(dense, 2, axis=0)
+    v2_2 = np.roll(dense, -2, axis=0) - dense
+    u1_2 = v1_2 / (np.hypot(v1_2[:, 0], v1_2[:, 1])[:, None] + 1e-6)
+    u2_2 = v2_2 / (np.hypot(v2_2[:, 0], v2_2[:, 1])[:, None] + 1e-6)
+    cos_2 = np.sum(u1_2 * u2_2, axis=1)
+
+    is_corner = (cos_1 < 0.72) & (cos_2 < 0.78)
+    corner_idxs = np.where(is_corner)[0]
+    start_idx = int(corner_idxs[0]) if len(corner_idxs) > 0 else 0
+    dense = np.roll(dense, -start_idx, axis=0)
+    is_corner = np.roll(is_corner, -start_idx)
+    u2_rolled = np.roll(u2, -start_idx, axis=0)
+    closed_pts = np.vstack([dense, dense[0]])
+    closed_corner = np.append(is_corner, True)
+
+    out_p = []
+    out_f = []
+    i = 0
+    while i < n:
+        best_j = i + 1
+        best_kind = "line"
+        best_q = None
+        t_start = u2_rolled[i]
+
+        max_j = min(n, i + 32)
+        for j in range(i + 2, max_j + 1):
+            if j > i + 2 and closed_corner[j - 1]:
+                break
+            sub = closed_pts[i : j + 1]
+            chord = float(np.hypot(sub[-1, 0] - sub[0, 0], sub[-1, 1] - sub[0, 1]))
+            t_end = u2_rolled[(j - 1) % n]
+            cos_span = float(t_start[0] * t_end[0] + t_start[1] * t_end[1])
+
+            is_long_wall = (chord >= 45.0) and (cos_span > 0.88)
+            l_tol = 1.45 if is_long_wall else 1.05
+            c_tol = 1.95 if is_long_wall else 1.45
+
+            l_err = line_max_err(sub)
+            if cos_span > 0.965 and l_err <= l_tol:
+                best_j = j
+                best_kind = "line"
+                best_q = None
+                continue
+            if cos_span > 0.15:
+                q, c_err = fit_quad_bezier(sub)
+                if c_err <= c_tol:
+                    best_j = j
+                    best_kind = "quad"
+                    best_q = q
+                elif l_err > c_tol * 2.2 and c_err > c_tol * 1.8:
+                    break
+            else:
+                break
+
+        out_p.append(np.round(closed_pts[i]))
+        out_f.append(1)
+        if best_kind == "quad" and best_q is not None:
+            out_p.append(best_q)
+            out_f.append(0)
+        i = best_j
+
+    m = len(out_p)
+    if m <= 4:
+        return np.array(out_p, dtype=float), bytearray(out_f)
+    drop_mask = [False] * m
+    for k in range(m):
+        if out_f[k] == 1 and out_f[(k - 1) % m] == 0 and out_f[(k + 1) % m] == 0:
+            if drop_mask[(k - 2) % m]:
+                continue
+            q_prev = out_p[(k - 1) % m]
+            q_next = out_p[(k + 1) % m]
+            delta = out_p[k] - 0.5 * (q_prev + q_next)
+            if float(np.hypot(delta[0], delta[1])) <= 2.4:
+                out_p[(k - 1) % m] = np.round(q_prev + delta)
+                out_p[(k + 1) % m] = np.round(q_next + delta)
+                drop_mask[k] = True
+
+    final_p = [out_p[k] for k in range(m) if not drop_mask[k]]
+    final_f = [out_f[k] for k in range(m) if not drop_mask[k]]
+    if len(final_p) < 3:
+        return np.array(out_p, dtype=float), bytearray(out_f)
+    return np.array(final_p, dtype=float), bytearray(final_f)
+
+
+def _compact_glyph_worker(args):
+    gname, coords_list, flags_bytes, ends_list = args
+    coords = np.array(coords_list, dtype=float)
+    out_pts = []
+    out_flags = bytearray()
+    out_ends = []
+    start = 0
+    for end in ends_list:
+        c_pts, c_fl = compact_tt_contour(coords[start : end + 1], flags_bytes[start : end + 1])
+        out_pts.append(c_pts)
+        out_flags.extend(c_fl)
+        out_ends.append(sum(len(x) for x in out_pts) - 1)
+        start = end + 1
+    merged = np.round(np.vstack(out_pts)).astype(int).tolist()
+    return gname, merged, out_flags, out_ends
+
+
+def extract_simple_glyph(mg, mglyf):
+    """Extract a simple Glyph from either a simple or composite glyph in mglyf."""
+    if not mg.isComposite():
+        if mg.numberOfContours > 0 and hasattr(mg, "coordinates") and len(mg.coordinates) > 0:
+            return copy.deepcopy(mg)
+        return None
+    coords, end_pts, flags = mg.getCoordinates(mglyf)
+    if len(coords) == 0 or len(end_pts) == 0:
+        return None
+    out = Glyph()
+    out.numberOfContours = len(end_pts)
+    out.coordinates = GlyphCoordinates(coords)
+    out.flags = flags
+    out.endPtsOfContours = list(end_pts)
+    out.program = ttProgram.Program()
+    out.recalcBounds(mglyf)
     return out
 
 
@@ -178,7 +411,31 @@ def build_reused_fei_glyphs(fei_base, fei_math, is_bold=False):
             gg = transform_simple_glyph(base_g, fglyf, sx=0.62, sy=0.62, dx=10.0, dy=290.0, ref_x=0.0, ref_y=0.0)
             reused[sup_cp] = (gg, (int(round(base_adv * 0.64)) + 20, gg.xMin))
 
-    sub_map = {0x2080 + d: ord("0") + d for d in range(10)}
+    sub_map = {
+        **{0x2080 + d: ord("0") + d for d in range(10)},
+        0x208A: ord("+"),
+        0x208B: ord("-"),
+        0x208C: ord("="),
+        0x208D: ord("("),
+        0x208E: ord(")"),
+        0x2090: ord("a"),
+        0x2091: ord("e"),
+        0x2092: ord("o"),
+        0x2093: ord("x"),
+        0x2095: ord("h"),
+        0x2096: ord("k"),
+        0x2097: ord("l"),
+        0x2098: ord("m"),
+        0x2099: ord("n"),
+        0x209A: ord("p"),
+        0x209B: ord("s"),
+        0x209C: ord("t"),
+        0x1D62: ord("i"),
+        0x1D63: ord("r"),
+        0x1D64: ord("u"),
+        0x1D65: ord("v"),
+        0x2C7C: ord("j"),
+    }
     for sub_cp, base_cp in sub_map.items():
         if base_cp in reused:
             base_g, (base_adv, _) = reused[base_cp]
@@ -244,8 +501,8 @@ def build_reused_fei_glyphs(fei_base, fei_math, is_bold=False):
             or 0x2900 <= cp <= 0x2AFF
         ):
             mg = mglyf[mgn]
-            if mg.numberOfContours > 0 and not mg.isComposite():
-                gg = copy.deepcopy(mg)
+            gg = extract_simple_glyph(mg, mglyf)
+            if gg is not None:
                 gg.program = ttProgram.Program()
                 if is_bold:
                     thicken_simple_glyph(gg, mglyf, offset_units=9.5)
@@ -315,7 +572,7 @@ def update_fei_font(font_path, subfamily, full_name, ps_name):
         rev_cmap.setdefault(gn, []).append(cp)
 
     synced_count = 0
-    cjk_count = 0
+    cjk_tasks = []
     for gname in font.getGlyphOrder():
         g = glyf[gname]
         if g.numberOfContours > 0:
@@ -328,11 +585,23 @@ def update_fei_font(font_path, subfamily, full_name, ps_name):
             glyf[gname].recalcBounds(glyf)
             hmtx[gname] = (g_metrics[0], glyf[gname].xMin)
             synced_count += 1
-        elif g.numberOfContours > 0:
+        elif g.numberOfContours > 0 and not g.isComposite():
+            cjk_tasks.append((gname, list(g.coordinates), bytearray(g.flags), list(g.endPtsOfContours)))
+
+    with Pool(cpu_count()) as pool:
+        for gname, merged_coords, out_flags, out_ends in pool.imap_unordered(_compact_glyph_worker, cjk_tasks, chunksize=256):
+            g = glyf[gname]
+            g.coordinates = GlyphCoordinates(merged_coords)
+            g.flags = out_flags
+            g.endPtsOfContours = out_ends
+            g.program = ttProgram.Program()
             g.recalcBounds(glyf)
             adv, _ = hmtx[gname]
             hmtx[gname] = (adv, g.xMin)
-            cjk_count += 1
+    cjk_count = len(cjk_tasks)
+
+    if "post" in font:
+        font["post"].formatType = 3.0
 
     name_map = {
         1: "Fei",

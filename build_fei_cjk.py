@@ -509,9 +509,13 @@ def measure_glyph_stroke_units(coords, flags, ends):
         pts_img = [(float((p[0] - x0) * scale + pad), float((y1 - p[1]) * scale + pad)) for p in c_pts]
         polys.append((area, pts_img))
         s = e + 1
-    for area, pts_img in sorted(polys, key=lambda x: x[0]):
+    if not polys:
+        return 62.0
+    outer_sign = 1.0 if max(polys, key=lambda x: abs(x[0]))[0] >= 0 else -1.0
+    for area, pts_img in sorted(polys, key=lambda x: -abs(x[0])):
         if len(pts_img) >= 3:
-            d.polygon(pts_img, fill=255 if area < 0 else 0)
+            is_outer = (area * outer_sign) >= 0
+            d.polygon(pts_img, fill=255 if is_outer else 0)
     arr = np.array(im) > 128
     if not arr.any():
         return 62.0
@@ -520,8 +524,12 @@ def measure_glyph_stroke_units(coords, flags, ends):
 
 
 def adjust_glyph_stroke_thickness(coords, flags, end_pts, delta_w):
-    """Adjust a simple glyph's stroke thickness by delta_w per side, guarded by opposing-wall distance."""
-    if abs(delta_w) < 0.15:
+    """
+    Universal winding-invariant stroke thickness adjustment:
+    For ANY contour with signed area A, n_ink = -sign(A) * [-ty, tx] ALWAYS points from the ink
+    into the surrounding white space (outward on outer contours, inward on counter holes, for both CW and CCW)!
+    """
+    if abs(delta_w) < 0.10:
         return coords
     out = coords.copy()
     total_pts = len(out)
@@ -535,17 +543,24 @@ def adjust_glyph_stroke_thickness(coords, flags, end_pts, delta_w):
     start = 0
     for end in end_pts:
         pts = out[start : end + 1]
-        n = len(pts)
         px, py = pts[:, 0], pts[:, 1]
         area = 0.5 * float(np.sum(px * np.roll(py, -1) - np.roll(px, -1) * py))
         areas.append((start, end, area))
-        if n >= 4:
+        start = end + 1
+
+    if not areas:
+        return out
+    outer_sign = 1.0 if max(areas, key=lambda x: abs(x[2]))[2] >= 0 else -1.0
+    sgn = -outer_sign
+
+    for start, end, area in areas:
+        pts = out[start : end + 1]
+        if len(pts) >= 4:
             d = np.roll(pts, -1, axis=0) - np.roll(pts, 1, axis=0)
             t = d / (np.hypot(d[:, 0], d[:, 1])[:, None] + 1e-6)
-            normals = smooth_1d_periodic(np.column_stack([-t[:, 1], t[:, 0]]), passes=2)
+            normals = smooth_1d_periodic(sgn * np.column_stack([-t[:, 1], t[:, 0]]), passes=2)
             normals = normals / (np.hypot(normals[:, 0], normals[:, 1])[:, None] + 1e-6)
             all_normals[start : end + 1] = normals
-        start = end + 1
 
     for start, end, area in areas:
         pts = out[start : end + 1].copy()
@@ -553,45 +568,80 @@ def adjust_glyph_stroke_thickness(coords, flags, end_pts, delta_w):
         if n < 4:
             continue
         normals = all_normals[start : end + 1]
-        if area < 0:
-            c_rows = np.arange(start, end + 1)
-            same_c = (idx_all[None, :] >= start) & (idx_all[None, :] <= end)
-            c_pos = c_rows[:, None] - start
-            j_pos = idx_all[None, :] - start
-            cyc_d = np.minimum(np.abs(c_pos - j_pos), n - np.abs(c_pos - j_pos))
-            ignore = same_c & (cyc_d <= 2)
+        c_rows = np.arange(start, end + 1)
+        same_c = (idx_all[None, :] >= start) & (idx_all[None, :] <= end)
+        c_pos = c_rows[:, None] - start
+        j_pos = idx_all[None, :] - start
+        cyc_d = np.minimum(np.abs(c_pos - j_pos), n - np.abs(c_pos - j_pos))
+        ignore = same_c & (cyc_d <= 2)
 
-            dx_sub = diff_x[c_rows, :]
-            dy_sub = diff_y[c_rows, :]
-            d_sub = np.where(ignore, 1e6, dist_all[c_rows, :])
-            dir_cos = (dx_sub * normals[:, 0:1] + dy_sub * normals[:, 1:2]) / d_sub
-            norm_dot = normals[:, 0:1] * all_normals[None, :, 0] + normals[:, 1:2] * all_normals[None, :, 1]
+        dx_sub = diff_x[c_rows, :]
+        dy_sub = diff_y[c_rows, :]
+        d_sub = np.where(ignore, 1e6, dist_all[c_rows, :])
+        dir_cos = (dx_sub * normals[:, 0:1] + dy_sub * normals[:, 1:2]) / d_sub
+        norm_dot = normals[:, 0:1] * all_normals[None, :, 0] + normals[:, 1:2] * all_normals[None, :, 1]
 
+        is_outer = (area * outer_sign) >= 0
+        if is_outer:
             if delta_w > 0:
                 is_opp = (dir_cos > 0.45) & (norm_dot < -0.30)
                 ahead_dist = np.where(is_opp, d_sub, 1e6).min(axis=1)
-                max_allow = smooth_1d_periodic(np.maximum(0.0, 0.36 * (ahead_dist - 14.0)), passes=2)
+                max_allow = smooth_1d_periodic(np.maximum(0.0, 0.38 * (ahead_dist - 14.0)), passes=2)
                 off = np.minimum(delta_w, max_allow)
             else:
-                is_back = (dir_cos < -0.55) & (norm_dot < -0.30) & (d_sub >= 18.0)
+                is_back = (dir_cos < -0.55) & (norm_dot < -0.30) & (d_sub >= 14.0)
                 self_th = np.where(is_back, d_sub, 1e6).min(axis=1)
-                min_allow = -smooth_1d_periodic(np.maximum(0.0, 0.42 * (self_th - 28.0)), passes=2)
+                min_allow = -smooth_1d_periodic(np.maximum(0.0, 0.44 * (self_th - 22.0)), passes=2)
                 off = np.maximum(delta_w, min_allow)
             pts = pts + off[:, None] * normals
-        elif area > 0 and delta_w > 0:
-            pts = pts + (0.25 * delta_w) * normals
+        else:
+            if delta_w > 0:
+                is_opp = (dir_cos > 0.40) & (norm_dot < -0.25)
+                hole_diam = np.where(is_opp, d_sub, 1e6).min(axis=1)
+                max_hole_shrink = smooth_1d_periodic(np.maximum(0.0, 0.34 * (hole_diam - 38.0)), passes=2)
+                off = np.minimum(1.35 * delta_w, max_hole_shrink)
+                pts = pts + off[:, None] * normals
+            else:
+                pts = pts + (0.85 * delta_w) * normals
         out[start : end + 1] = pts
     return out
 
 
+def fit_coords_to_exact_bbox(coords, tx0, ty0, tx1, ty1):
+    """Map coords onto exact target bounding box (tx0, ty0)..(tx1, ty1) with exact integer endpoints."""
+    cx0, cy0 = coords.min(axis=0)
+    cx1, cy1 = coords.max(axis=0)
+    cw = cx1 - cx0
+    ch = cy1 - cy0
+    tw = tx1 - tx0
+    th = ty1 - ty0
+    out = coords.copy()
+    if cw > 1e-4:
+        out[:, 0] = tx0 + (out[:, 0] - cx0) * (tw / cw)
+    else:
+        out[:, 0] = tx0
+    if ch > 1e-4:
+        out[:, 1] = ty0 + (out[:, 1] - cy0) * (th / ch)
+    else:
+        out[:, 1] = ty0
+    ic = np.round(out).astype(int)
+    ic[:, 0] = np.clip(ic[:, 0], tx0, tx1)
+    ic[:, 1] = np.clip(ic[:, 1], ty0, ty1)
+    if len(ic) > 0:
+        ic[np.argmin(out[:, 0]), 0] = tx0
+        ic[np.argmax(out[:, 0]), 0] = tx1
+        ic[np.argmin(out[:, 1]), 1] = ty0
+        ic[np.argmax(out[:, 1]), 1] = ty1
+    return ic
+
+
 def redesign_english_bezier_anime(orig_g, glyf_table, ch, old_adv, old_lsb, punct_dy, is_bold=False):
-    """Redesign an English/ASCII glyph into the bigger, fuller unified Anime look with equalized stroke weight."""
+    """Redesign an English/ASCII glyph into the unified Anime look while preserving exact original dimensions."""
     gg = copy.deepcopy(orig_g)
     if gg.isComposite() or gg.numberOfContours <= 0 or not hasattr(gg, "coordinates") or len(gg.coordinates) == 0:
         return gg, (old_adv, old_lsb)
 
-    old_w = gg.xMax - gg.xMin
-    rsb = max(32, old_adv - (old_lsb + old_w))
+    orig_x0, orig_y0, orig_x1, orig_y1 = int(gg.xMin), int(gg.yMin), int(gg.xMax), int(gg.yMax)
     coords = np.array(gg.coordinates, dtype=float)
     flags = bytearray(gg.flags)
     end_pts = gg.endPtsOfContours
@@ -607,8 +657,6 @@ def redesign_english_bezier_anime(orig_g, glyf_table, ch, old_adv, old_lsb, punc
         u = np.clip((coords[:, 0] - cx) / rw, -1.25, 1.25)
         v = np.clip((coords[:, 1] - cy) / rh, -1.25, 1.25)
         u2, v2 = np.clip(u * u, 0.0, 1.0), np.clip(v * v, 0.0, 1.0)
-        # Separable Shear-Scale Anime Diffeomorphism (du'/du depends ONLY on v so center stems like 'T'
-        # and outer stems like 'h', 'H', 'n' maintain identical stroke thickness!)
         sx_v = 1.0 + 0.12 * (1.0 - v2) - 0.025 * v
         bx_v = 0.020 * (1.0 - v2) + 0.018 * v
         sy_u = 1.0 + 0.08 * (1.0 - u2)
@@ -616,58 +664,20 @@ def redesign_english_bezier_anime(orig_g, glyf_table, ch, old_adv, old_lsb, punc
         coords[:, 0] = cx + rw * 1.04 * (sx_v * u + bx_v)
         coords[:, 1] = cy + rh * (sy_u * v + by_u)
 
-    x0, y0 = coords.min(axis=0)
-    x1, y1 = coords.max(axis=0)
-    cur_h = max(20.0, y1 - y0)
+    coords = fit_coords_to_exact_bbox(coords, orig_x0, orig_y0, orig_x1, orig_y1).astype(float)
 
-    round_bottom = ch in "CGOSUcosu035689"
-    overshoot = -10.0 if round_bottom else 0.0
-    if "A" <= ch <= "Z" or "0" <= ch <= "9":
-        target_ymin = -22.0 if ch == "Q" else (-14.0 if ch == "J" else overshoot)
-        target_ymax = 650.0
-    elif ch in "acemnorsuvwxz":
-        target_ymin = overshoot
-        target_ymax = 472.0
-    elif ch in "bdfhkl":
-        target_ymin = 0.0
-        target_ymax = 670.0
-    elif ch == "t":
-        target_ymin = 0.0
-        target_ymax = 580.0
-    elif ch == "i":
-        target_ymin = 0.0
-        target_ymax = 610.0
-    elif ch in "gpqy":
-        target_ymin = -170.0
-        target_ymax = 472.0
-    elif ch == "j":
-        target_ymin = -170.0
-        target_ymax = 610.0
-    else:
-        target_ymin = y0 + punct_dy
-        target_ymax = y1 + punct_dy
-
-    target_h = target_ymax - target_ymin
-    sy = target_h / cur_h if ch.isalnum() else 1.07
-    sx = float(np.clip(sy, 0.96, 1.14)) if ch.isalnum() else 1.07
-    coords[:, 0] = x0 + sx * (coords[:, 0] - x0)
-    coords[:, 1] = target_ymin + sy * (coords[:, 1] - y0)
-
-    # Equalize stroke thickness across all alphanumeric glyphs (slimming overly thick 'T', 'I', '1' and plumping thin letters)
     if ch.isalnum():
         cur_sw = measure_glyph_stroke_units(coords, flags, end_pts)
-        target_sw = 82.0 if is_bold else 63.0
-        delta_w = float(np.clip(0.55 * (target_sw - cur_sw), -8.5, 5.5))
+        target_sw = 80.0 if is_bold else 61.0
+        delta_w = float(np.clip(0.55 * (target_sw - cur_sw), -7.5, 6.0))
         coords = adjust_glyph_stroke_thickness(coords, flags, end_pts, delta_w)
 
-    lsb = max(30, old_lsb)
-    coords[:, 0] += lsb - coords[:, 0].min()
-    gg.coordinates = GlyphCoordinates(np.round(coords).astype(int).tolist())
+    ic = fit_coords_to_exact_bbox(coords, orig_x0, orig_y0, orig_x1, orig_y1)
+    gg.coordinates = GlyphCoordinates(ic.tolist())
     gg.flags = flags
     gg.program = ttProgram.Program()
     gg.recalcBounds(glyf_table)
-    new_w = gg.xMax - gg.xMin
-    return gg, (lsb + new_w + rsb, gg.xMin)
+    return gg, (old_adv, gg.xMin)
 
 
 def open_concave_bays_perfect(pts, target_w=27.0):
@@ -1081,8 +1091,14 @@ def _cjk_anime_remodel_worker(args):
             out_e.append(sum(len(x) for x in out_p) - 1)
     if not out_p:
         return gname, None
-    merged = np.round(np.vstack(out_p)).astype(int).tolist()
-    return gname, (merged, out_f, out_e, adv)
+    merged = fit_coords_to_exact_bbox(
+        np.vstack(out_p),
+        int(round(orig_c[:, 0].min())),
+        int(round(orig_c[:, 1].min())),
+        int(round(orig_c[:, 0].max())),
+        int(round(orig_c[:, 1].max())),
+    ).tolist()
+    return gname, (merged, out_f, out_e, 1000)
 
 
 def thicken_simple_glyph(g, glyf_table, offset_units):
@@ -1114,7 +1130,7 @@ def thicken_simple_glyph(g, glyf_table, offset_units):
     g.recalcBounds(glyf_table)
 
 
-def build_reused_fei_glyphs(fei_base, fei_math, is_bold=False):
+def build_reused_fei_glyphs(fei_base, fei_math, is_bold=False, preserve_existing_ascii=False):
     fcmap = fei_base.getBestCmap()
     fglyf = fei_base["glyf"]
     fhmtx = fei_base["hmtx"]
@@ -1134,11 +1150,11 @@ def build_reused_fei_glyphs(fei_base, fei_math, is_bold=False):
             fgn = fcmap[cp]
             orig_g = fglyf[fgn]
             adv, lsb = fhmtx[fgn]
-            if orig_g.numberOfContours > 0 and not orig_g.isComposite() and cp <= 0x007E:
+            if not preserve_existing_ascii and orig_g.numberOfContours > 0 and not orig_g.isComposite() and cp <= 0x007E:
                 ch = chr(cp)
                 gg, new_m = redesign_english_bezier_anime(orig_g, fglyf, ch, adv, lsb, punct_dy, is_bold=is_bold)
                 reused[cp] = (gg, new_m)
-            elif orig_g.numberOfContours > 0 and not orig_g.isComposite():
+            elif not preserve_existing_ascii and orig_g.numberOfContours > 0 and not orig_g.isComposite():
                 gg = transform_simple_glyph(orig_g, fglyf, dy=punct_dy)
                 reused[cp] = (gg, (adv, gg.xMin))
             else:
@@ -1164,11 +1180,12 @@ def build_reused_fei_glyphs(fei_base, fei_math, is_bold=False):
         0x207E: ord(")"),
         0x207F: ord("n"),
     }
-    sup_gain = 10.5 if is_bold else 8.2
+    sup_gain = 11.5 if is_bold else 8.8
+    x_ymin = float(fglyf[fcmap[ord("x")]].yMin) if ord("x") in fcmap else 0.0
     for sup_cp, base_cp in sup_map.items():
         if base_cp in reused:
             base_g, (base_adv, _) = reused[base_cp]
-            gg = transform_simple_glyph(base_g, fglyf, sx=0.66, sy=0.65, dx=12.0, dy=282.0, ref_x=0.0, ref_y=0.0)
+            gg = transform_simple_glyph(base_g, fglyf, sx=0.66, sy=0.65, dx=12.0, dy=268.0, ref_x=0.0, ref_y=x_ymin)
             if gg.numberOfContours > 0 and not gg.isComposite():
                 c_sup = adjust_glyph_stroke_thickness(
                     np.array(gg.coordinates, dtype=float), gg.flags, gg.endPtsOfContours, delta_w=sup_gain
@@ -1205,7 +1222,7 @@ def build_reused_fei_glyphs(fei_base, fei_math, is_bold=False):
     for sub_cp, base_cp in sub_map.items():
         if base_cp in reused:
             base_g, (base_adv, _) = reused[base_cp]
-            gg = transform_simple_glyph(base_g, fglyf, sx=0.66, sy=0.65, dx=12.0, dy=-125.0, ref_x=0.0, ref_y=0.0)
+            gg = transform_simple_glyph(base_g, fglyf, sx=0.66, sy=0.65, dx=12.0, dy=-95.0, ref_x=0.0, ref_y=x_ymin)
             if gg.numberOfContours > 0 and not gg.isComposite():
                 c_sub = adjust_glyph_stroke_thickness(
                     np.array(gg.coordinates, dtype=float), gg.flags, gg.endPtsOfContours, delta_w=sup_gain
@@ -1273,19 +1290,50 @@ def build_reused_fei_glyphs(fei_base, fei_math, is_bold=False):
             gg = extract_simple_glyph(mg, mglyf)
             if gg is not None:
                 gg.program = ttProgram.Program()
-                if is_bold:
-                    thicken_simple_glyph(gg, mglyf, offset_units=9.5)
                 gg.recalcBounds(mglyf)
                 m_adv, _ = mhmtx[mgn]
+                # Align FeiMath Greek & math symbols (built on y=0 baseline) to Gaegu's English baseline & scale!
+                if cp >= 0x0370 and x_ymin > 40.0 and gg.numberOfContours > 0:
+                    gg = transform_simple_glyph(gg, mglyf, sx=0.88, sy=0.88, dx=0.0, dy=0.85 * x_ymin, ref_x=0.0, ref_y=0.0)
+                    m_adv = int(round(m_adv * 0.90))
                 gh = gg.yMax - gg.yMin
                 gw = gg.xMax - gg.xMin
-                if cp >= 0x2190 and (gh > 640 or gg.yMin < -80):
-                    s_fit = min(1.0, 620.0 / max(1.0, gh))
+                if cp >= 0x2190 and (gh > 640 or gg.yMin < -40):
+                    s_fit = min(1.0, 580.0 / max(1.0, gh))
                     cx_m = 0.5 * (gg.xMin + gg.xMax)
                     cy_m = 0.5 * (gg.yMin + gg.yMax)
                     gg = transform_simple_glyph(
-                        gg, mglyf, sx=s_fit, sy=s_fit, dx=0.0, dy=290.0 - cy_m, ref_x=cx_m, ref_y=cy_m
+                        gg, mglyf, sx=s_fit, sy=s_fit, dx=0.0, dy=(280.0 + 0.65 * x_ymin) - cy_m, ref_x=cx_m, ref_y=cy_m
                     )
+                    gw = gg.xMax - gg.xMin
+                # Regulate stroke thickness of imported Greek and Math Symbols to match Regular (51u) / Bold (68u),
+                # while keeping double-struck blackboard bold letters (ℂ,ℍ,ℕ,ℙ,ℚ,ℝ,ℤ) crisp and un-clogged!
+                double_struck_cps = {0x2102, 0x210D, 0x2115, 0x2119, 0x211A, 0x211D, 0x2124}
+                if (
+                    gg.numberOfContours > 0
+                    and not gg.isComposite()
+                    and max(gw, gh) > 45
+                    and cp not in double_struck_cps
+                    and (is_bold or not (0x00C0 <= cp <= 0x017F))
+                ):
+                    c_m = np.array(gg.coordinates, dtype=float)
+                    target_sw = 68.0 if is_bold else 51.0
+                    for _ in range(2):
+                        cur_sw = measure_glyph_stroke_units(c_m, gg.flags, gg.endPtsOfContours)
+                        err = target_sw - cur_sw
+                        if abs(err) < 1.0:
+                            break
+                        dw = float(np.clip(0.58 * err, -8.5, 11.0 if is_bold else 7.0))
+                        c_m = adjust_glyph_stroke_thickness(c_m, gg.flags, gg.endPtsOfContours, dw)
+                    gg.coordinates = GlyphCoordinates(np.round(c_m).astype(int).tolist())
+                    gg.recalcBounds(mglyf)
+                    gw = gg.xMax - gg.xMin
+                elif cp in double_struck_cps and is_bold and gg.numberOfContours > 0:
+                    c_m = adjust_glyph_stroke_thickness(
+                        np.array(gg.coordinates, dtype=float), gg.flags, gg.endPtsOfContours, delta_w=2.2
+                    )
+                    gg.coordinates = GlyphCoordinates(np.round(c_m).astype(int).tolist())
+                    gg.recalcBounds(mglyf)
                     gw = gg.xMax - gg.xMin
                 if cp >= 0x2190:
                     pad_side = 55

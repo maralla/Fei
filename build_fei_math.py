@@ -242,6 +242,129 @@ def anime_round_and_plump_contour(coords, flags, end_pts, plump_offset=2.2, roun
     return out_coords, out_flags
 
 
+def measure_math_glyph_stroke_units(coords, flags, ends):
+    """Measure 85th-percentile stroke thickness of a glyph in font units (1000 UPM) via 250px raster EDT."""
+    scale = 0.25
+    pad = 24
+    x0, y0 = coords.min(axis=0)
+    x1, y1 = coords.max(axis=0)
+    W = int(np.ceil((x1 - x0) * scale)) + 2 * pad
+    H = int(np.ceil((y1 - y0) * scale)) + 2 * pad
+    if W < 10 or H < 10:
+        return 55.0
+    from PIL import Image, ImageDraw
+    from scipy.ndimage import distance_transform_edt
+
+    im = Image.new("L", (W, H), 0)
+    d = ImageDraw.Draw(im)
+    s = 0
+    polys = []
+    for e in ends:
+        c_pts = coords[s : e + 1]
+        px, py = c_pts[:, 0], c_pts[:, 1]
+        area = 0.5 * float(np.sum(px * np.roll(py, -1) - np.roll(px, -1) * py))
+        pts_img = [(float((p[0] - x0) * scale + pad), float((y1 - p[1]) * scale + pad)) for p in c_pts]
+        polys.append((area, pts_img))
+        s = e + 1
+    if not polys:
+        return 55.0
+    outer_sign = 1.0 if max(polys, key=lambda x: abs(x[0]))[0] >= 0 else -1.0
+    # Draw outer contours (same sign as largest contour) first in 255, then inner holes in 0!
+    for area, pts_img in sorted(polys, key=lambda x: -abs(x[0])):
+        if len(pts_img) >= 3:
+            is_outer = (area * outer_sign) >= 0
+            d.polygon(pts_img, fill=255 if is_outer else 0)
+    arr = np.array(im) > 128
+    if not arr.any():
+        return 55.0
+    dt = distance_transform_edt(arr)
+    return float(np.percentile(dt[arr], 85) * 2.0 / scale)
+
+
+def adjust_math_glyph_stroke_thickness(coords, flags, end_pts, delta_w):
+    """
+    Universal winding-invariant stroke thickness adjustment:
+    For ANY contour with signed area A, n_ink = -sign(A) * [-ty, tx] ALWAYS points from the ink
+    into the surrounding white space (outward on outer contours, inward on counter holes, for both CW and CCW)!
+    """
+    if abs(delta_w) < 0.10:
+        return coords
+    out = coords.copy()
+    total_pts = len(out)
+    idx_all = np.arange(total_pts)
+    diff_x = out[None, :, 0] - out[:, None, 0]
+    diff_y = out[None, :, 1] - out[:, None, 1]
+    dist_all = np.sqrt(diff_x * diff_x + diff_y * diff_y) + 1e-6
+
+    all_normals = np.zeros_like(out)
+    areas = []
+    start = 0
+    for end in end_pts:
+        pts = out[start : end + 1]
+        px, py = pts[:, 0], pts[:, 1]
+        area = 0.5 * float(np.sum(px * np.roll(py, -1) - np.roll(px, -1) * py))
+        areas.append((start, end, area))
+        start = end + 1
+
+    if not areas:
+        return out
+    outer_sign = 1.0 if max(areas, key=lambda x: abs(x[2]))[2] >= 0 else -1.0
+    sgn = -outer_sign
+
+    for start, end, area in areas:
+        pts = out[start : end + 1]
+        if len(pts) >= 4:
+            d = np.roll(pts, -1, axis=0) - np.roll(pts, 1, axis=0)
+            t = d / (np.hypot(d[:, 0], d[:, 1])[:, None] + 1e-6)
+            normals = smooth_1d_periodic(sgn * np.column_stack([-t[:, 1], t[:, 0]]), passes=2)
+            normals = normals / (np.hypot(normals[:, 0], normals[:, 1])[:, None] + 1e-6)
+            all_normals[start : end + 1] = normals
+
+    for start, end, area in areas:
+        pts = out[start : end + 1].copy()
+        n = len(pts)
+        if n < 4:
+            continue
+        normals = all_normals[start : end + 1]
+        c_rows = np.arange(start, end + 1)
+        same_c = (idx_all[None, :] >= start) & (idx_all[None, :] <= end)
+        c_pos = c_rows[:, None] - start
+        j_pos = idx_all[None, :] - start
+        cyc_d = np.minimum(np.abs(c_pos - j_pos), n - np.abs(c_pos - j_pos))
+        ignore = same_c & (cyc_d <= 2)
+
+        dx_sub = diff_x[c_rows, :]
+        dy_sub = diff_y[c_rows, :]
+        d_sub = np.where(ignore, 1e6, dist_all[c_rows, :])
+        dir_cos = (dx_sub * normals[:, 0:1] + dy_sub * normals[:, 1:2]) / d_sub
+        norm_dot = normals[:, 0:1] * all_normals[None, :, 0] + normals[:, 1:2] * all_normals[None, :, 1]
+
+        is_outer = (area * outer_sign) >= 0
+        if is_outer:
+            if delta_w > 0:
+                is_opp = (dir_cos > 0.45) & (norm_dot < -0.30)
+                ahead_dist = np.where(is_opp, d_sub, 1e6).min(axis=1)
+                max_allow = smooth_1d_periodic(np.maximum(0.0, 0.36 * (ahead_dist - 14.0)), passes=2)
+                off = np.minimum(delta_w, max_allow)
+            else:
+                is_back = (dir_cos < -0.55) & (norm_dot < -0.30) & (d_sub >= 14.0)
+                self_th = np.where(is_back, d_sub, 1e6).min(axis=1)
+                min_allow = -smooth_1d_periodic(np.maximum(0.0, 0.44 * (self_th - 22.0)), passes=2)
+                off = np.maximum(delta_w, min_allow)
+            pts = pts + off[:, None] * normals
+        else:
+            if delta_w > 0:
+                is_opp = (dir_cos > 0.40) & (norm_dot < -0.25)
+                hole_diam = np.where(is_opp, d_sub, 1e6).min(axis=1)
+                max_allow = smooth_1d_periodic(np.maximum(0.0, 0.34 * (hole_diam - 34.0)), passes=2)
+                off = np.minimum(delta_w, max_allow)
+                pts = pts + off[:, None] * normals
+            else:
+                pts = pts + (0.85 * delta_w) * normals
+        out[start : end + 1] = pts
+    return out
+
+
 def remodel_math_glyph_anime(coords, flags, end_pts, kind="italic_lower"):
     """
     Remodel a mathematical alphanumeric, Greek, or operator glyph into the unified Anime style:
@@ -249,11 +372,11 @@ def remodel_math_glyph_anime(coords, flags, end_pts, kind="italic_lower"):
     - Applies the Separable Shear-Scale Anime Cushion (opening bowls and giving strokes a
       warm, bouncy hand-drawn elasticity without thinning any stems).
     - Harmonizes vertical bounds (472u x-height for lowercase, 650u cap-height for uppercase/digits)
-      when kind is an alphanumeric or Greek letter, while preserving exact bounds for assembly/size variants.
+      and equalizes stroke weight to ~55u (~11.0px) so Math Italic, Greek, Operators, and upright ASCII
+      share a 100% uniform visual weight!
     """
-    plump = 2.4 if "alpha" in kind or "italic" in kind or "greek" in kind else 1.6
     r_passes = 4 if kind != "preserve_bounds" else 2
-    coords, flags = anime_round_and_plump_contour(coords, flags, end_pts, plump_offset=plump, round_passes=r_passes)
+    coords, flags = anime_round_and_plump_contour(coords, flags, end_pts, plump_offset=0.0, round_passes=r_passes)
 
     x0, y0 = coords.min(axis=0)
     x1, y1 = coords.max(axis=0)
@@ -276,6 +399,13 @@ def remodel_math_glyph_anime(coords, flags, end_pts, kind="italic_lower"):
         by_u = 0.022 * (1.0 - u2)
         coords[:, 0] = cx + rw * (sx_v * u + bx_v)
         coords[:, 1] = cy + rh * (sy_u * v + by_u)
+        # Regulate stroke thickness of operators & delimiters towards 55.5u (~11.1px) before re-locking bounds
+        if w > 35.0 and h > 35.0:
+            cur_sw = measure_math_glyph_stroke_units(coords, flags, end_pts)
+            err = 55.5 - cur_sw
+            if abs(err) > 1.2:
+                dw = float(np.clip(0.55 * err, -6.5, 4.0))
+                coords = adjust_math_glyph_stroke_thickness(coords, flags, end_pts, dw)
         # Re-lock exact vertical and horizontal min/max so MATH table connectors/assemblies never shift
         nx0, ny0 = coords.min(axis=0)
         nx1, ny1 = coords.max(axis=0)
@@ -285,32 +415,37 @@ def remodel_math_glyph_anime(coords, flags, end_pts, kind="italic_lower"):
             coords[:, 1] = y0 + (h / (ny1 - ny0)) * (coords[:, 1] - ny0)
         return coords, flags
 
+    is_double_struck = kind == "double_struck"
+    is_bold_math = kind.endswith("_bold")
+    base_kind = "upper_or_digit" if is_double_struck else (kind[:-5] if is_bold_math else kind)
+
     # For Alphanumerics & Greek: Separable Anime Cushion (plump round bowls, open chest, bouncy C-arc!)
-    sx_v = 1.0 + 0.14 * (1.0 - v2) + 0.04 * v
-    bx_v = 0.032 * (1.0 - v2) + 0.018 * v
-    sy_u = 1.0 + 0.10 * (1.0 - u2)
-    by_u = 0.030 * (1.0 - u2)
-    coords[:, 0] = cx + rw * 1.05 * (sx_v * u + bx_v)
-    coords[:, 1] = cy + rh * (sy_u * v + by_u)
+    if not is_double_struck:
+        sx_v = 1.0 + 0.10 * (1.0 - v2) + 0.03 * v
+        bx_v = 0.028 * (1.0 - v2) + 0.015 * v
+        sy_u = 1.0 + 0.08 * (1.0 - u2)
+        by_u = 0.025 * (1.0 - u2)
+        coords[:, 0] = cx + rw * 1.03 * (sx_v * u + bx_v)
+        coords[:, 1] = cy + rh * (sy_u * v + by_u)
 
     nx0, ny0 = coords.min(axis=0)
     nx1, ny1 = coords.max(axis=0)
     cur_h = max(20.0, ny1 - ny0)
 
     target_ymin, target_ymax = ny0, ny1
-    if kind == "upper_or_digit":
+    if base_kind == "upper_or_digit":
         target_ymin = -8.0 if ny0 < -4.0 else 0.0
         target_ymax = 650.0
-    elif kind == "lower_x":
+    elif base_kind == "lower_x":
         target_ymin = -8.0 if ny0 < -4.0 else 0.0
         target_ymax = 472.0
-    elif kind == "lower_asc":
+    elif base_kind == "lower_asc":
         target_ymin = -8.0 if ny0 < -4.0 else 0.0
         target_ymax = 670.0
-    elif kind == "lower_desc":
+    elif base_kind == "lower_desc":
         target_ymin = -170.0
         target_ymax = 472.0
-    elif kind == "lower_both":
+    elif base_kind == "lower_both":
         target_ymin = -170.0
         target_ymax = 660.0
 
@@ -319,6 +454,20 @@ def remodel_math_glyph_anime(coords, flags, end_pts, kind="italic_lower"):
     sx = float(np.clip(sy, 0.94, 1.12))
     coords[:, 0] = x0 + sx * (coords[:, 0] - nx0)
     coords[:, 1] = target_ymin + sy * (coords[:, 1] - ny0)
+
+    if is_double_struck:
+        # Keep the narrow white slit between the two parallel stems of double-struck letters (ℝ, ℂ, ℕ, ℤ) crisp and open!
+        return coords, flags
+
+    # 2-Pass Closed-Loop Stroke Thickness Equalizer so Math Italic, Greek, and Digits share uniform weight!
+    target_sw = 76.0 if is_bold_math else 55.5
+    for _ in range(2):
+        cur_sw = measure_math_glyph_stroke_units(coords, flags, end_pts)
+        err = target_sw - cur_sw
+        if abs(err) < 1.0:
+            break
+        dw = float(np.clip(0.58 * err, -9.5, 5.5))
+        coords = adjust_math_glyph_stroke_thickness(coords, flags, end_pts, dw)
     return coords, flags
 
 
@@ -456,22 +605,37 @@ def build_accented_latin_glyphs(fei_reg, fei_math):
             final_adv = max(base_adv, g_comp.xMax + 28)
             built[cp] = (g_comp, (final_adv, g_comp.xMin))
 
-    # Also remodel 'ç' (U+00E7) and 'Ç' (U+00C7) using Fei-Regular's new 'c'/'C' + cedilla hook!
+    # Also remodel 'ç' (U+00E7) and 'Ç' (U+00C7) using Fei-Regular's exact 'c'/'C' + cedilla hook!
     for cp_ced, base_c in ((0x00E7, "c"), (0x00C7, "C")):
         if cp_ced in mcmap and ord(base_c) in rcmap:
-            gg_old = extract_simple_glyph(mglyf[mcmap[cp_ced]], mglyf)
-            if gg_old is not None:
-                c_old, f_old = remodel_math_glyph_anime(
-                    np.array(gg_old.coordinates, dtype=float),
-                    gg_old.flags,
-                    gg_old.endPtsOfContours,
-                    kind="lower_desc" if base_c == "c" else "upper_or_digit",
-                )
-                gg_old.coordinates = GlyphCoordinates(np.round(c_old).astype(int).tolist())
-                gg_old.flags = f_old
-                gg_old.recalcBounds(mglyf)
-                adv_c, _ = rhmtx[rcmap[ord(base_c)]]
-                built[cp_ced] = (gg_old, (adv_c, gg_old.xMin))
+            g_base = copy.deepcopy(rglyf[rcmap[ord(base_c)]])
+            adv_c, _ = rhmtx[rcmap[ord(base_c)]]
+            bcx = 0.5 * (g_base.xMin + g_base.xMax)
+            by0 = float(g_base.yMin)
+            # Build a cute rounded cedilla hook right below the bottom of 'c'/'C'
+            hook_pts = np.array([
+                [bcx - 16, by0 + 18],
+                [bcx + 18, by0 + 18],
+                [bcx + 12, by0 - 22],
+                [bcx + 42, by0 - 38],
+                [bcx + 52, by0 - 76],
+                [bcx + 28, by0 - 115],
+                [bcx - 22, by0 - 118],
+                [bcx - 52, by0 - 98],
+                [bcx - 36, by0 - 66],
+                [bcx - 8,  by0 - 74],
+                [bcx + 8,  by0 - 66],
+                [bcx + 2,  by0 - 48],
+                [bcx - 24, by0 - 34],
+            ], dtype=float)
+            g_hook = copy.deepcopy(g_idot)
+            g_hook.numberOfContours = 1
+            g_hook.endPtsOfContours = [len(hook_pts) - 1]
+            g_hook.flags = bytearray([1] * len(hook_pts))
+            g_hook.coordinates = GlyphCoordinates(np.round(hook_pts).astype(int).tolist())
+            g_hook.recalcBounds(rglyf)
+            g_ced = combine_simple_glyphs([(g_base, 0.0, 0.0), (g_hook, 0.0, 0.0)], rglyf)
+            built[cp_ced] = (g_ced, (adv_c, g_ced.xMin))
 
     return built
 
@@ -490,18 +654,21 @@ def classify_math_glyph(gname, cps, vert_parts, horiz_parts):
     # Mathematical Alphanumeric Symbols (U+1D400..U+1D7FF) & Greek (U+0370..U+03FF)
     if 0x1D400 <= cp <= 0x1D7FF or 0x0370 <= cp <= 0x03FF or 0x2100 <= cp <= 0x214F:
         name = unicodedata.name(chr(cp), "")
+        if "DOUBLE-STRUCK" in name:
+            return "double_struck"
+        bold_suffix = "_bold" if "BOLD" in name else ""
         if "DIGIT" in name or "CAPITAL" in name:
-            return "upper_or_digit"
+            return "upper_or_digit" + bold_suffix
         if "SMALL" in name:
             # Check for ascenders / descenders among small Latin/Greek letters
             for word in name.split():
                 if word in ("B", "D", "H", "K", "L", "T", "I", "THETA", "DELTA", "LAMBDA"):
-                    return "lower_asc"
+                    return "lower_asc" + bold_suffix
                 if word in ("G", "P", "Q", "Y", "GAMMA", "ETA", "MU", "RHO", "CHI", "PSI"):
-                    return "lower_desc"
+                    return "lower_desc" + bold_suffix
                 if word in ("F", "J", "BETA", "ZETA", "XI", "PHI"):
-                    return "lower_both"
-            return "lower_x"
+                    return "lower_both" + bold_suffix
+            return "lower_x" + bold_suffix
     return "preserve_bounds"
 
 
@@ -548,16 +715,49 @@ def update_fei_math():
     # 1. Build clean Anime accented Latin glyphs (including 'ï' with full-sized diaeresis dots!)
     accented_map = build_accented_latin_glyphs(fei_reg, font)
 
-    # 2. Sync upright ASCII letters & digits (A-Z, a-z, 0-9) directly from our remodeled Fei-Regular.ttf
+    # 2. Sync upright ASCII letters & digits (A-Z, a-z, 0-9) from Fei-Regular.ttf,
+    #    scaled to OpenType MATH dimensions (cap/digit=645, x-height=472 on y=0 baseline) so
+    #    upright 'Attention', 'softmax', and digits '1, 2, 6' match math italic 'Q, K, V, x, n, p'!
     synced_ascii = 0
     for ch_code in list(range(ord("0"), ord("9") + 1)) + list(range(ord("A"), ord("Z") + 1)) + list(range(ord("a"), ord("z") + 1)):
         if ch_code in cmap and ch_code in rcmap:
             mgn = cmap[ch_code]
             rgn = rcmap[ch_code]
-            glyf[mgn] = copy.deepcopy(rglyf[rgn])
+            gg = copy.deepcopy(rglyf[rgn])
+            ch = chr(ch_code)
+            adv, lsb = rhmtx[rgn]
+            if gg.numberOfContours > 0 and not gg.isComposite():
+                coords = np.array(gg.coordinates, dtype=float)
+                x0, y0 = coords.min(axis=0)
+                x1, y1 = coords.max(axis=0)
+                cur_h = max(20.0, y1 - y0)
+                overshoot = -10.0 if ch in "CGOSUcosu035689" else 0.0
+                if "A" <= ch <= "Z" or "0" <= ch <= "9":
+                    ty0 = -20.0 if ch == "Q" else (-12.0 if ch == "J" else overshoot)
+                    ty1 = 645.0
+                elif ch in "acemnorsuvwxz":
+                    ty0, ty1 = overshoot, 472.0
+                elif ch in "bdfhkl":
+                    ty0, ty1 = 0.0, 665.0
+                elif ch == "t":
+                    ty0, ty1 = 0.0, 575.0
+                elif ch == "i":
+                    ty0, ty1 = 0.0, 605.0
+                elif ch in "gpqy":
+                    ty0, ty1 = -170.0, 472.0
+                else:
+                    ty0, ty1 = -170.0, 605.0
+                sy = (ty1 - ty0) / cur_h
+                sx = float(np.clip(sy, 0.98, 1.18))
+                old_rsb = max(28, adv - x1)
+                coords[:, 0] = x0 + sx * (coords[:, 0] - x0)
+                coords[:, 1] = ty0 + sy * (coords[:, 1] - y0)
+                gg.coordinates = GlyphCoordinates(np.round(coords).astype(int).tolist())
+                gg.recalcBounds(glyf)
+                adv = int(round(gg.xMax + old_rsb))
+            glyf[mgn] = gg
             glyf[mgn].program = ttProgram.Program()
             glyf[mgn].recalcBounds(glyf)
-            adv, _ = rhmtx[rgn]
             hmtx[mgn] = (adv, glyf[mgn].xMin)
             synced_ascii += 1
 
@@ -667,14 +867,14 @@ def update_fei_math():
             if base_gn in glyf and glyf[base_gn].numberOfContours > 0 and not glyf[base_gn].isComposite():
                 is_ssty2 = gname.endswith(".ssty2")
                 bg = glyf[base_gn]
-                # Preserve the optical weight gain (+1.8u for .ssty, +3.0u for .ssty2) on top of the remodeled base glyph
-                bc, bf = anime_round_and_plump_contour(
+                # Preserve optical weight gain (+4.8u for .ssty, +7.5u for .ssty2) so 0.70x scripts match main weight!
+                bc = adjust_math_glyph_stroke_thickness(
                     np.array(bg.coordinates, dtype=float),
                     bg.flags,
                     bg.endPtsOfContours,
-                    plump_offset=2.8 if is_ssty2 else 1.6,
-                    round_passes=1,
+                    delta_w=7.5 if is_ssty2 else 4.8,
                 )
+                bf = bytearray(bg.flags)
                 sg = copy.deepcopy(bg)
                 sg.coordinates = GlyphCoordinates(np.round(bc).astype(int).tolist())
                 sg.flags = bf

@@ -1,6 +1,6 @@
 # Fei Typeface Family (手写字体家族)
 
-**Fei** is a unified, cozy hand-drawn OpenType & TrueType typeface family designed for high visual comfort across **Simplified Chinese**, **Traditional Chinese**, **English / Latin**, **Greek**, and **Mathematical Typesetting**.
+**Fei** is a unified, cozy hand-drawn OpenType & TrueType typeface family designed for high visual comfort across **Simplified Chinese**, **Traditional Chinese**, **English / Latin**, **Greek**, **Source Code (Monospace)**, and **Mathematical Typesetting**.
 
 ![Fei Typeface Showcase](showcase.png)
 
@@ -12,6 +12,8 @@
 | :--- | :--- | ---: | ---: | :--- |
 | **`Fei-Regular.ttf`** | Regular (`400`) | `18,658` | `9.4 MB` | Primary text font covering Latin, Greek, Symbols, Simplified Chinese (GB2312), and Traditional Chinese (Big5). |
 | **`Fei-Bold.ttf`** | Bold (`700`) | `18,658` | `10.6 MB` | Companion bold weight for headings, emphasis, and UI titles with counter-preserving bold strokes. |
+| **`Fei-Italic.ttf`** | Italic (`400`) | `589` | `114 KB` | Hand-drawn italic companion covering Latin, Accented Latin, Greek, Cyrillic, and Punctuation (zero CJK duplication). |
+| **`FeiMono-Regular.ttf`** | Monospace (`400`) | `733` | `140 KB` | Fixed-width (`500u` cell) hand-drawn coding typeface with disambiguated `0` (center dot), `1`, `l`, `i`, and box-drawing glyphs. |
 | **`FeiMath-Regular.ttf`** | Math (`400`) | `6,611` | `1.4 MB` | Full OpenType `MATH` font with mathematical alphanumerics, script variants (`.ssty` / `.ssty2`), extensible delimiters (`.s1–.s12`), radicals, and display operators. |
 
 ---
@@ -44,6 +46,9 @@ python3 build_fei_math.py
 
 # Refine and synchronize Fei-Regular.ttf and Fei-Bold.ttf
 python3 build_fei_cjk.py
+
+# Build Fei-Italic.ttf and FeiMono-Regular.ttf
+python3 build_fei_italic_mono.py
 ```
 
 ---
